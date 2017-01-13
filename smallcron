@@ -1,0 +1,450 @@
+#! /usr/bin/env perl
+use strict;
+use warnings;
+use feature qw{ say };
+use Mojo::IOLoop;
+use Time::Local;
+use FileHandle;
+use Data::Dumper;
+
+my $RELOAD_SECOND   = 60; # loop cycle
+my $SCHEDULE_MINUTE = 5;  # schedule cycle
+my $SCHEDULE_FILE_PATH = '/var/citool/etc/cron.txt';
+my $SCHEDULE_LOG_PATH  = '/var/citool/logs/schedule.log';
+my $RESULT_LOG_PATH    = '/var/citool/logs/result.log';
+
+my $time;;
+my %jobs;
+my $inputBody = '';
+
+sub getParser
+{
+	if($SCHEDULE_FILE_PATH)
+	{
+		my $fh = FileHandle->new($SCHEDULE_FILE_PATH, 'r') or die(
+			'cannot read ' . $SCHEDULE_FILE_PATH
+		);
+		while(my $buff = $fh->getline) { $inputBody .= $buff; }
+		$fh->close;
+	}
+	elsif(not $inputBody)
+	{
+		while(read STDIN, my $buff, 100) { $inputBody .= $buff; }
+	}
+	my $parser = Parse::Cron->new();
+	$parser->parse($inputBody)
+}
+
+sub getNowDatetime
+{
+	my($sec,$min,$hour,$day,$mon,$year,$wday) = localtime($time);
+	+{
+		second => $sec,
+		minute  => $min,
+		hour    => $hour,
+		day     => $day,
+		month   => $mon + 1,
+		year    => $year + 1900,
+		weekday => $wday,
+	}
+}
+
+sub datetime2string
+{
+	my($dt) = @_;
+	sprintf(
+		"%d-%02d-%02d %02d:%02d:%02d",
+		$dt->{'year'},
+		$dt->{'month'},
+		$dt->{'day'},
+		$dt->{'hour'},
+		$dt->{'minute'},
+		$dt->{'second'},
+	)
+}
+
+sub writeScheduleLog
+{
+	return unless $SCHEDULE_LOG_PATH;
+	my($string) = @_;
+	my $fh = FileHandle->new($SCHEDULE_LOG_PATH, 'a') or die(
+		'cannot write ' . $SCHEDULE_LOG_PATH
+	);
+	my $nowDatetime = getNowDatetime;
+	my $datetimeString = datetime2string($nowDatetime);
+	$fh->printf("[%s] %s\n", $datetimeString, $string);
+	$fh->close;
+}
+
+sub writeResultLog
+{
+	return unless $RESULT_LOG_PATH;
+	my($string) = @_;
+	my $fh = FileHandle->new($RESULT_LOG_PATH, 'a') or die(
+		'cannot write ' . $RESULT_LOG_PATH
+	);
+	my $nowDatetime = getNowDatetime;
+	my $datetimeString = datetime2string($nowDatetime);
+	$fh->printf("[%s] %s\n", $datetimeString, $string);
+	$fh->close;
+}
+
+#
+# $weekdayNumber : 0:Sun 1:Mon 2:Tue 3:Wed 4:Thu 5:Fri 6:Sat
+#
+sub getDaysAfterNextWeekday
+{
+	my($weekdayNumber) = @_;
+	my $nowDatetime = getNowDatetime;
+	$nowDatetime->{'wday'} < $weekdayNumber ?
+		$weekdayNumber - $nowDatetime->{'wday'} :
+		$weekdayNumber - $nowDatetime->{'wday'} + 7
+	;
+}
+
+sub isValidDatetime
+{
+	my($year,$month,$day,$hour,$min,$sec,$wday) = @_;
+	for my $arg($year,$month,$day,$hour,$min,$sec)
+	{
+		return if $arg !~ /^\d+$/
+	}
+	return if(
+		$month < 1 or $month > 12 or
+		$day > 31 or $hour > 23 or $min > 59 or $sec > 59
+	);
+	return if($wday and $wday ne '*' and $wday > 6);
+	return 1
+}
+
+#
+# 最も近い未来の実行日時を求めます。
+#
+# 5,10,15 4 * * * shutdown -h 0
+#
+# のようなカンマ区切りは事前に以下の形式に展開してください。
+#
+# 5 4 * * * shutdown -h 0
+# 10 4 * * * shutdown -h 0
+# 15 4 * * * shutdown -h 0
+#
+sub getScheduleDatetime
+{
+	my($schedule) = @_;
+	my $hourExtend  = 0; # 1 or 0
+	my $dayExtend   = 0; # 1 or 0
+	my $monthExtend = 0; # 1 or 0
+	my $yearExtend  = 0; # 1 or 0
+
+	my $nowDatetime = getNowDatetime;
+
+	my $min   = $schedule->{'minute'};
+	my $hour  = $schedule->{'hour'}  eq '*' ? $nowDatetime->{'hour'}  : $schedule->{'hour'};
+	my $day   = $schedule->{'day'}   eq '*' ? $nowDatetime->{'day'}   : $schedule->{'day'};
+	my $wday  = $schedule->{'weekday'}  eq '7' ? 0 : $schedule->{'weekday'};
+	my $month = $schedule->{'month'} eq '*' ? $nowDatetime->{'month'}: $schedule->{'month'};
+	my $year  = $nowDatetime->{'year'};
+
+	return if not isValidDatetime($year,$month,$day,$hour,$min,0,$wday); 
+
+	# hour
+	if($nowDatetime->{'minute'} > $min)
+	{
+		if($schedule->{'hour'} eq '*')     { $hourExtend  = 1 }
+		elsif($schedule->{'day'} eq '*')   { $dayExtend   = 1 }
+		elsif($schedule->{'month'} eq '*') { $monthExtend = 1 }
+		else                               { $yearExtend  = 1 }
+	}
+	# day
+	if($nowDatetime->{'hour'} > $hour)
+	{
+		if($schedule->{'day'} eq '*')      { $dayExtend   = 1 }
+		elsif($schedule->{'month'} eq '*') { $monthExtend = 1 }
+		else                               { $yearExtend  = 1 }
+	}
+	# month
+	if($nowDatetime->{'day'} > $day)
+	{
+		if($schedule->{'month'} eq '*') { $monthExtend = 1 }
+		else                            { $yearExtend  = 1 }
+	}
+	# year
+	if($nowDatetime->{'month'} > $month)
+	{
+		$yearExtend  = 1
+	}
+
+	# Add year & month
+	my $paramMonth = $month - 1 + $monthExtend;
+	if($paramMonth >= 12)
+	{
+		$paramMonth = 0;
+		$yearExtend = 1;
+	}
+
+	my $scheduleTime  = timelocal(0,$min,$hour,$day,$paramMonth, $year + $yearExtend);
+
+
+	# Add day & hour
+	$scheduleTime += $hourExtend * 3600 + $dayExtend * 3600 * 24;
+
+	my($rsec,$rmin,$rhour,$rday,$rmon,$ryear,$rwday) = localtime($scheduleTime);
+	return if($wday ne '*' and $rwday ne $wday); 
+	+{
+		second  => $rsec,
+		minute  => $rmin,
+		hour    => $rhour,
+		day     => $rday,
+		month   => $rmon + 1,
+		year    => $ryear + 1900,
+		weekday => $rwday,
+	}
+}
+
+#
+# 5分以内に起こるスケジュールを抽出
+#
+sub getRecentSchedules
+{
+	my $parser = getParser;
+	my $nowDatetime = getNowDatetime();
+	my @result;
+
+	while(my $row = $parser->iterate)
+	{
+		my $dt = getScheduleDatetime($row) or next;
+
+		my $scheduleTime = timelocal(
+			$dt->{'second'},
+			$dt->{'minute'},
+			$dt->{'hour'},
+			$dt->{'day'},
+			$dt->{'month'} - 1,
+			$dt->{'year'},
+		);
+		if($scheduleTime > $time and $time + $SCHEDULE_MINUTE * 60 > $scheduleTime)
+		{
+			$row->{'secondAfter'} = $scheduleTime - $time;
+			push @result, $row;
+		}
+	}
+	\@result
+}
+
+sub setSchedule
+{
+	my($scheduleHash) = @_;
+	my $parser = Parse::Cron->new();
+	my $digest = $parser->getDigestByHashRef($scheduleHash, 'secondAfter');
+	$jobs{$digest} = $scheduleHash;
+	writeScheduleLog(
+		$scheduleHash->{'cli'} . ' at ' .
+		$scheduleHash->{'secondAfter'} . 'seconds after.'
+	);
+
+	Mojo::IOLoop->timer($scheduleHash->{'secondAfter'} => sub {
+		my $cli = $scheduleHash->{'cli'};
+		system($cli . ' >> ' . $RESULT_LOG_PATH . ' 2>&1 &');
+		my $result = $? >> 8 ? 'FAIL' : 'SUCCESS';
+		delete $jobs{$digest};
+		writeResultLog($result . ' ' . $scheduleHash->{'cli'});
+	});
+}
+
+sub scheduleHasSet
+{
+	my($scheduleHash) = @_;
+	my $parser = Parse::Cron->new();
+	my $digest = $parser->getDigestByHashRef($scheduleHash, 'secondAfter');
+    exists $jobs{$digest} ? 1 : undef
+}
+
+sub timeEmulation
+{
+	# 1484291635 - 15 * 60 # 1/13 15:58:55
+	time
+}
+
+#
+# 1分毎に全探索して5分以内に起こるスケジュールをタイマー登録
+#
+sub reloadSchedule
+{
+	$time = timeEmulation;
+	Mojo::IOLoop->timer($RELOAD_SECOND => sub {
+		writeScheduleLog('RELOAD');
+		my $schedules = getRecentSchedules;
+		for my $schedule(@$schedules)
+		{
+			# 既に登録済なら無視
+			next if scheduleHasSet($schedule);
+			# 登録
+			setSchedule($schedule);
+		}
+		reloadSchedule()
+	})
+}
+
+sub loop
+{
+	Mojo::IOLoop->server({ port => '8081' } => sub {
+		my($loop, $stream, $id) = @_;
+		#
+		# ここからコマンドライン
+		#
+		$stream->on(read => sub {
+			my($stream, $bytes) = @_;
+			$bytes =~ tr/\r\n//d;
+			if($bytes eq 'shutdown')
+			{
+				$stream->write("CITool is shutting down....\n");
+				Mojo::IOLoop->timer(2 => sub { Mojo::IOLoop->reset });
+			}
+			elsif($bytes eq 'quit')
+			{
+				$stream->write("byebye\n");
+				Mojo::IOLoop->remove($id);
+			}
+			elsif($bytes eq 'reload')
+			{
+				reloadSchedule;
+				$stream->write("RELOADED\n");
+			}
+		});
+	});
+	reloadSchedule;
+	Mojo::IOLoop->start unless Mojo::IOLoop->is_running;
+}
+
+loop;
+
+package Parse::Cron;
+use strict;
+use warnings;
+use feature qw{ say };
+use Digest::MD5;
+use Data::Dumper;
+
+sub new
+{
+	my($class, %args) = @_;
+	$args{'parsed'} = [];
+	bless \%args, $class
+}
+
+sub parsed
+{
+	my($self,$ref) = @_;
+	$self->{'parsed'} = $ref;
+	$self->{'counter'} = 0;
+	$self
+}
+
+sub iterate
+{
+	my($self) = @_;
+	my $i = $self->{'counter'} ++;
+	if($i > $#{$self->{'parsed'}})
+	{
+		$self->{'counter'} = 0;
+		return;
+	}
+	$self->{'parsed'}[$i]
+}
+sub getDigestByHashRef
+{
+	my($self,$scheduleHash, @ignoreList) = @_;
+	my %ignoreHash = map { $_ => '' } @ignoreList;
+	my $md5 = Digest::MD5->new();
+	for my $key(sort keys %$scheduleHash)
+	{
+		next if exists $ignoreHash{$key};
+		$md5->add($key)->add($scheduleHash->{$key});
+	}
+	$md5->hexdigest()
+}
+
+sub explode
+{
+	my($self,$hashs) = @_;
+	my %inserted;
+	for(my $i=0; $i<=$#$hashs; $i++)
+	{
+		my $isMatched = 0;
+		for my $key(qw{minute hour day month weekday})
+		{
+			my @tmp = split /,/, $hashs->[$i]{$key};
+			if($#tmp > 0)
+			{
+				for(my $j=0; $j<=$#tmp; $j++)
+				{
+					my %hash = %{$hashs->[$i]};
+					$hash{$key} = $tmp[$j];
+					my $digest = $self->getDigestByHashRef(\%hash);
+					$isMatched = 1;
+					next if exists $inserted{$digest};
+					$inserted{$digest} = '';
+					push @$hashs, \%hash;
+				}
+			}
+		}
+		undef $hashs->[$i] if $isMatched;
+	}
+	@$hashs = grep { $_ } @$hashs;
+}
+
+sub parse
+{
+	my($self,$fbody) = @_;
+	my @rows = split /\r?\n/, $fbody;
+	grep { s/^\s+// } @rows;
+	@rows = grep { /^[^#]/ } @rows;
+	my @result;
+
+	for my $row(@rows)
+	{
+		my($minute, $hour, $day, $month, $weekday, $cli) = split /\s/, $row, 6;
+		$cli or next;
+		push @result, {
+			minute  => $minute,
+			hour    => $hour,
+			day     => $day,
+			month   => $month,
+			weekday => $weekday,
+			cli     => $cli,
+		};
+	}
+
+	$self->explode(\@result);
+	$self->parsed(\@result);
+}
+
+1
+
+__END__
+
+先頭付近の以下5箇所をそれなりに設定します。
+
+my $RELOAD_SECOND   = 60; # loop cycle
+
+スケジュールファイルのリロード周期です。(60秒毎)
+
+my $SCHEDULE_MINUTE = 5;  # schedule cycle
+
+5で最長5分後の予定まで予約します。
+
+my $SCHEDULE_FILE_PATH = '/var/citool/etc/cron.txt';
+
+スケジュールファイルのパスです。crontab形式です。
+*/5 の形式は使えません。5,10,15 の形式は使えます。
+
+0,1,5,10 1,2,3,4,5 * * * echo '寝たら死ぬぞi!!'
+
+my $SCHEDULE_LOG_PATH  = '/var/citool/logs/schedule.log';
+
+スケジュール登録のログファイルです。空文字ならログ出力しません。
+
+my $RESULT_LOG_PATH    = '/var/citool/logs/result.log';
+
+スケジュール実行結果のログファイルです。空文字ならログ出力しません。
+
