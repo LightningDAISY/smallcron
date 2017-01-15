@@ -7,8 +7,9 @@ use Time::Local;
 use FileHandle;
 use Data::Dumper;
 
-my $RELOAD_SECOND   = 60; # loop cycle
-my $SCHEDULE_MINUTE = 5;  # schedule cycle
+my $RELOAD_SECOND   = 60;   # loop cycle
+my $SCHEDULE_MINUTE = 5;    # schedule cycle
+my $TELNET_PORT     = 8081; # port number
 my $SCHEDULE_FILE_PATH = '/var/citool/etc/cron.txt';
 my $SCHEDULE_LOG_PATH  = '/var/citool/logs/schedule.log';
 my $RESULT_LOG_PATH    = '/var/citool/logs/result.log';
@@ -287,7 +288,7 @@ sub reloadSchedule
 
 sub loop
 {
-	Mojo::IOLoop->server({ port => '8081' } => sub {
+	Mojo::IOLoop->server({ port => $TELNET_PORT } => sub {
 		my($loop, $stream, $id) = @_;
 		#
 		# ここからコマンドライン
