@@ -5,15 +5,18 @@ use feature qw{ say };
 use Mojo::IOLoop;
 use Time::Local;
 use FileHandle;
+use IO::Compress::Gzip qw{ gzip $GzipError };
 use Data::Dumper;
 
-my $RELOAD_SECOND   = 60; # loop cycle
-my $SCHEDULE_MINUTE = 5;  # schedule cycle
+my $RELOAD_SECOND   = 60;   # loop cycle
+my $SCHEDULE_MINUTE = 5;    # schedule cycle
+my $TELNET_PORT     = 8081; # port number
 my $SCHEDULE_FILE_PATH = '/var/citool/etc/cron.txt';
 my $SCHEDULE_LOG_PATH  = '/var/citool/logs/schedule.log';
 my $RESULT_LOG_PATH    = '/var/citool/logs/result.log';
+my $LOG_ROTATE_DIR     = '/var/citool/logs/old';
 
-my $time;;
+my $time;
 my %jobs;
 my $inputBody = '';
 
@@ -63,15 +66,42 @@ sub datetime2string
 	)
 }
 
+sub rotateLog
+{
+	my($path) = @_;
+	return unless $LOG_ROTATE_DIR;
+	my $mtime = (stat($path))[9];
+	my($sec,$min,$hour,$day,$mon,$year) = localtime $mtime;
+	my $nowDatetime = getNowDatetime;
+
+	#return $nowDatetime->{'day'} == $day
+
+	{
+		my @parts = split m!(?:/|\\)!, $path;
+		my $fname = $parts[$#parts];
+		my $rotateFilePath = sprintf('%s/%s.%s%02d%02d.gz', $LOG_ROTATE_DIR, $fname, $year, $mon, $day);
+		gzip $path => $rotateFilePath or do {
+			say 'gzip failed: ' . $GzipError;
+			return
+		};
+	}
+	my $fh = FileHandle->new($path, 'w') or do {
+		say 'cannot rotate: ' . $GzipError;
+		return;
+	};
+	$fh->close
+}
+
 sub writeScheduleLog
 {
 	return unless $SCHEDULE_LOG_PATH;
 	my($string) = @_;
+	rotateLog($SCHEDULE_LOG_PATH);
 	my $fh = FileHandle->new($SCHEDULE_LOG_PATH, 'a') or die(
 		'cannot write ' . $SCHEDULE_LOG_PATH
 	);
 	my $nowDatetime = getNowDatetime;
-	my $datetimeString = datetime2string($nowDatetime);
+	my $datetimeString = $LOG_ROTATE_DIR . datetime2string($nowDatetime);
 	$fh->printf("[%s] %s\n", $datetimeString, $string);
 	$fh->close;
 }
@@ -80,6 +110,7 @@ sub writeResultLog
 {
 	return unless $RESULT_LOG_PATH;
 	my($string) = @_;
+	rotateLog($RESULT_LOG_PATH);
 	my $fh = FileHandle->new($RESULT_LOG_PATH, 'a') or die(
 		'cannot write ' . $RESULT_LOG_PATH
 	);
@@ -285,9 +316,40 @@ sub reloadSchedule
 	})
 }
 
+sub readResultLog
+{
+	my $fh = FileHandle->new($RESULT_LOG_PATH, 'r') or die(
+		'cannot read ' . $RESULT_LOG_PATH
+	);
+	my $fbody = '';
+	while(my $buff = $fh->getline)
+	{
+		$fbody .= $buff;
+	}
+	$fh->close;
+	$fbody
+}
+
+sub showLog
+{
+	my($stream, $limit) = @_;
+	my $log = readResultLog;
+	my $counter = 0;
+	while($log =~ /(.+)\r?\n/g)
+	{
+		my $row = $1;
+		if($row =~ /^\[([\d\s:-]+)\] (SUCCESS|FAIL) (.+)/)
+		{
+			$counter++;
+			$stream->write(sprintf("[%s] %s %s\n", $2, $1, $3));
+			last if $counter > $limit
+		}
+	}
+}
+
 sub loop
 {
-	Mojo::IOLoop->server({ port => '8081' } => sub {
+	Mojo::IOLoop->server({ port => $TELNET_PORT } => sub {
 		my($loop, $stream, $id) = @_;
 		#
 		# ここからコマンドライン
@@ -295,21 +357,34 @@ sub loop
 		$stream->on(read => sub {
 			my($stream, $bytes) = @_;
 			$bytes =~ tr/\r\n//d;
-			if($bytes eq 'shutdown')
+			if(lc $bytes eq 'shutdown')
 			{
 				$stream->write("CITool is shutting down....\n");
 				Mojo::IOLoop->timer(2 => sub { Mojo::IOLoop->reset });
 			}
-			elsif($bytes eq 'quit')
+			elsif(lc $bytes eq 'quit')
 			{
 				$stream->write("byebye\n");
 				Mojo::IOLoop->remove($id);
 			}
-			elsif($bytes eq 'reload')
+			elsif(lc $bytes eq 'reload')
 			{
 				reloadSchedule;
 				$stream->write("RELOADED\n");
 			}
+			elsif($bytes =~ /^show(?:\s+)?(\d+)?/i)
+			{
+				my $number = $1 || 10;
+				showLog($stream,$number) if $RESULT_LOG_PATH;
+			}
+			elsif($bytes =~ /^rotate/i)
+			{
+				rotateLog($SCHEDULE_LOG_PATH);
+				rotateLog($RESULT_LOG_PATH);
+				$stream->write("rotated\n");
+			}
+
+
 		});
 	});
 	reloadSchedule;
@@ -423,7 +498,7 @@ sub parse
 
 __END__
 
-先頭付近の以下5箇所をそれなりに設定します。
+先頭付近の以下をそれなりに設定します。
 
 my $RELOAD_SECOND   = 60; # loop cycle
 
@@ -447,4 +522,11 @@ my $SCHEDULE_LOG_PATH  = '/var/citool/logs/schedule.log';
 my $RESULT_LOG_PATH    = '/var/citool/logs/result.log';
 
 スケジュール実行結果のログファイルです。空文字ならログ出力しません。
+
+my $LOG_ROTATE_DIR = '/var/cittol/logs';
+
+ログを毎日退避させるディレクトリを指定します。空文字なら何もしません。
+
+
+
 
