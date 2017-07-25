@@ -15,6 +15,16 @@ my $SCHEDULE_FILE_PATH = '/var/citool/etc/cron.txt';
 my $SCHEDULE_LOG_PATH  = '/var/citool/logs/schedule.log';
 my $RESULT_LOG_PATH    = '/var/citool/logs/result.log';
 my $LOG_ROTATE_DIR     = '/var/citool/logs/old';
+my $VARIABLES_DIR      = '/var/citool/variables/';
+
+my $VARIABLES = {
+	cwid => [
+		qw{1111111 1111112 1111113}
+	],
+	cwname => [
+		qw{フェラー クリンスマン マテウス}
+	],
+};
 
 my $time;
 my %jobs;
@@ -22,6 +32,8 @@ my $inputBody = '';
 
 sub getParser
 {
+	my($option) = @_;
+	$inputBody = '';
 	if($SCHEDULE_FILE_PATH)
 	{
 		my $fh = FileHandle->new($SCHEDULE_FILE_PATH, 'r') or die(
@@ -35,7 +47,9 @@ sub getParser
 		while(read STDIN, my $buff, 100) { $inputBody .= $buff; }
 	}
 	my $parser = Parse::Cron->new();
-	$parser->parse($inputBody)
+	$parser->set(VARIABLES_DIR => $VARIABLES_DIR);
+	$parser->set(VARIABLES => $VARIABLES);
+	$parser->parse($inputBody, $option)
 }
 
 sub getNowDatetime
@@ -237,7 +251,9 @@ sub getScheduleDatetime
 #
 sub getRecentSchedules
 {
-	my $parser = getParser;
+	my($minute) = @_;
+	$minute ||= $SCHEDULE_MINUTE;
+	my $parser = getParser('novariables');
 	my $nowDatetime = getNowDatetime();
 	my @result;
 
@@ -253,7 +269,7 @@ sub getRecentSchedules
 			$dt->{'month'} - 1,
 			$dt->{'year'},
 		);
-		if($scheduleTime > $time and $time + $SCHEDULE_MINUTE * 60 > $scheduleTime)
+		if($scheduleTime > $time and $time + $minute * 60 > $scheduleTime)
 		{
 			$row->{'secondAfter'} = $scheduleTime - $time;
 			push @result, $row;
@@ -262,10 +278,53 @@ sub getRecentSchedules
 	\@result
 }
 
+sub getNextVariableValue
+{
+	my($name) = @_;
+	if(open my $fh, '<', $VARIABLES_DIR . $name)
+	{
+		my $buf;
+		my $fbody = '';
+		$fbody .= $buf while read $fh, $buf, 100;
+		close $fh;
+		chomp $fbody;
+
+		my $matched = 0;
+		for my $value(@{$VARIABLES->{$name}})
+		{
+			return $value if $matched;
+			$matched = 1 if $value eq $fbody;
+		}
+	}
+	$VARIABLES->{$name}[0]
+}
+
+sub updateVariables
+{
+	my($cli) = @_;
+	my $isMatched = 0;
+	for my $name(keys %$VARIABLES)
+	{
+	writeScheduleLog('VAL IS ' . $name);
+		if($cli =~ /\{\s*$name\s*\}/)
+		{
+	writeScheduleLog('VAL IS MATCHED');
+			my $nextValue = getNextVariableValue($name);
+	writeScheduleLog('VAL NEXT IS ' . $nextValue);
+			my $fname = $VARIABLES_DIR . $name;
+			open my $fh, '>', $fname or return;
+			print $fh $nextValue;
+			close $fh;
+		}
+	}
+}
+
 sub setSchedule
 {
 	my($scheduleHash) = @_;
 	my $parser = Parse::Cron->new();
+	$parser->set(VARIABLES_DIR => $VARIABLES_DIR);
+	$parser->set(VARIABLES => $VARIABLES);
 	my $digest = $parser->getDigestByHashRef($scheduleHash, 'secondAfter');
 	$jobs{$digest} = $scheduleHash;
 	writeScheduleLog(
@@ -275,8 +334,11 @@ sub setSchedule
 
 	Mojo::IOLoop->timer($scheduleHash->{'secondAfter'} => sub {
 		my $cli = $scheduleHash->{'cli'};
+		$parser->mergeVariables(\$cli) if $parser->{'VARIABLES_DIR'};
 		system($cli . ' >> ' . $RESULT_LOG_PATH . ' 2>&1 &');
 		my $result = $? >> 8 ? 'FAIL' : 'SUCCESS';
+
+		updateVariables($scheduleHash->{'cli'}) if $result eq 'SUCCESS';
 		delete $jobs{$digest};
 		writeResultLog($result . ' ' . $scheduleHash->{'cli'});
 	});
@@ -308,7 +370,11 @@ sub reloadSchedule
 		for my $schedule(@$schedules)
 		{
 			# 既に登録済なら無視
-			next if scheduleHasSet($schedule);
+			if(scheduleHasSet($schedule))
+			{
+				writeScheduleLog('1 record has scheduled.');
+				next;
+			}
 			# 登録
 			setSchedule($schedule);
 		}
@@ -321,6 +387,8 @@ sub readResultLog
 	my $fh = FileHandle->new($RESULT_LOG_PATH, 'r') or die(
 		'cannot read ' . $RESULT_LOG_PATH
 	);
+	while(my $buff = $fh->getline) { $inputBody .= $buff; }
+	$fh->close;
 	my $fbody = '';
 	while(my $buff = $fh->getline)
 	{
@@ -347,6 +415,202 @@ sub showLog
 	}
 }
 
+sub trim(\$)
+{
+	my($str) = @_;
+	$str =~ s/^\s+//;
+	$str =~ s/^\s+$//;
+}
+
+sub wday2JPN
+{
+	my($wday) = @_;
+	trim $wday;
+	if($wday eq '*')
+	{
+		$wday = ''
+	}
+	elsif($wday =~ /^[\d,]+$/)
+	{
+		my @jpwdays = split /,\s*/, $wday;
+		my @wdays;
+		for my $jpwday(@jpwdays)
+		{
+			push @wdays, qw{日 月 火 水 木 金 土}[$jpwday];
+		}
+		$wday = join ', ', @wdays;
+	}
+	$wday
+}
+
+sub month2JPN
+{
+	my($month) = @_;
+	trim $month;
+	if($month eq '*')
+	{
+		$month = ''
+	}
+	elsif($month =~ m!\*/(\d)!)
+	{
+		$month = $1 eq '1' ? '' : $1 . 'ヶ月毎'
+	}
+	elsif($month =~ /^[\d,]+$/)
+	{
+		$month .= '月';
+	}
+	$month
+}
+
+sub day2JPN
+{
+	my($day) = @_;
+	trim $day;
+	if($day eq '*')
+	{
+		$day = ''
+	}
+	elsif($day =~ m!\*/(\d)!)
+	{
+		$day = $1 eq '1' ? '' : $1 . '日毎'
+	}
+	elsif($day =~ /^[\d,]+$/)
+	{
+		$day .= '日';
+	}
+	$day
+}
+
+sub hour2JPN
+{
+	my($hour) = @_;
+	trim $hour;
+	if($hour eq '*')
+	{
+		$hour = ''
+	}
+	elsif($hour =~ m!\*/(\d)!)
+	{
+		$hour = $1 eq '1' ? '' : $1 . '時間毎'
+	}
+	elsif($hour =~ /^[\d,]+$/)
+	{
+		$hour .= '時';
+	}
+	$hour
+}
+
+sub minute2JPN
+{
+	my($minute) = @_;
+	trim $minute;
+	if($minute eq '*')
+	{
+		$minute = ''
+	}
+	elsif($minute =~ m!\*/(\d)!)
+	{
+		$minute = $1 . '分毎'
+	}
+	elsif($minute =~ /^[\d,]+$/)
+	{
+		$minute .= '分';
+	}
+	$minute
+}
+
+sub scheduleRow2JPN
+{
+	my($columns) = @_;
+
+	# 分 時 日 月 曜 CLI
+	my @schedule = (
+		month2JPN($columns->{'month'}),
+		day2JPN($columns->{'day'}),
+		wday2JPN($columns->{'weekday'}),
+		hour2JPN($columns->{'hour'}),
+		minute2JPN($columns->{'minute'}),
+		$columns->{'cli'},
+	);
+	join "\t", @schedule
+}
+
+sub getAllSchedule
+{
+	my($stream,$number) = @_;
+	$number ||= 1;
+	my $parser = getParser;
+	my @schedules;
+	for(my $i=0; $i<$number; $i++)
+	{
+		my $row = $parser->iterate or last;
+		push @schedules, $row;
+	}
+	\@schedules
+}
+
+sub showAllScheduleTSV
+{
+	my($stream,$number) = @_;
+	$number ||= 1;
+	my $schedules = getAllSchedule($stream, $number);
+
+	my @tsvRows;
+	for my $schedule(@$schedules)
+	{
+		push @tsvRows, scheduleRow2JPN($schedule);
+	}
+	$stream->write(join("\n", @tsvRows) . "\n")
+}
+
+sub addSchedule
+{
+	my($stream,$row) = @_;
+
+	my $fh = FileHandle->new($SCHEDULE_FILE_PATH, 'a') or die(
+		'cannot write ' . $SCHEDULE_FILE_PATH
+	);
+	chomp $row;
+	$fh->print($row . "\n");
+	$fh->close;
+}
+
+# TODO
+sub modifySchedule
+{
+	my($stream,$row) = @_;
+
+	my $fh = FileHandle->new($SCHEDULE_FILE_PATH, 'a') or die(
+		'cannot read ' . $SCHEDULE_FILE_PATH
+	);
+	chomp $row;
+	$fh->print($row . "\n");
+	$fh->close;
+}
+
+sub removeSchedule
+{
+	my($stream,$number) = @_;
+	$number = int $number;
+	my $fh = FileHandle->new($SCHEDULE_FILE_PATH, 'r') or die(
+		'cannot read ' . $SCHEDULE_FILE_PATH
+	);
+	my $fbody = '';
+	my $cnt = 0;
+	while(my $line = $fh->getline)
+	{
+		$cnt++;
+		$fbody .= $line if $cnt != $number;
+	}
+	$fh->close;
+
+	$fh = FileHandle->new($SCHEDULE_FILE_PATH, 'w') or die(
+		'cannot write ' . $SCHEDULE_FILE_PATH
+	);
+	$fh->print($fbody);
+	$fh->close;
+}
+
 sub loop
 {
 	Mojo::IOLoop->server({ port => $TELNET_PORT } => sub {
@@ -362,20 +626,35 @@ sub loop
 				$stream->write("CITool is shutting down....\n");
 				Mojo::IOLoop->timer(2 => sub { Mojo::IOLoop->reset });
 			}
-			elsif(lc $bytes eq 'quit')
+			elsif($bytes =~ /add\s+(.+)/i)
 			{
-				$stream->write("byebye\n");
-				Mojo::IOLoop->remove($id);
+				addSchedule($stream, $1);
+				$stream->write("ADDED\n");
+			}
+			elsif($bytes =~ /modify\s+(\d+)\s+(.+)/i)
+			{
+				modifySchedule($stream, $1, $2);
+				$stream->write("MODIFIED\n");
+			}
+			elsif($bytes =~ /remove\s+(\d+)/i)
+			{
+				removeSchedule($stream, $1);
+				$stream->write("REMOVED\n");
 			}
 			elsif(lc $bytes eq 'reload')
 			{
 				reloadSchedule;
 				$stream->write("RELOADED\n");
 			}
-			elsif($bytes =~ /^show(?:\s+)?(\d+)?/i)
+			elsif($bytes =~ /^log\s*(\d*)/i)
 			{
 				my $number = $1 || 10;
 				showLog($stream,$number) if $RESULT_LOG_PATH;
+			}
+			elsif($bytes =~ /^schedule\s*(\d*)/i)
+			{
+				my $number = $1 || 1;
+				showAllScheduleTSV($stream,$number);
 			}
 			elsif($bytes =~ /^rotate/i)
 			{
@@ -383,8 +662,11 @@ sub loop
 				rotateLog($RESULT_LOG_PATH);
 				$stream->write("rotated\n");
 			}
-
-
+			elsif(lc $bytes eq 'quit')
+			{
+				$stream->write("byebye\n");
+				Mojo::IOLoop->remove($id);
+			}
 		});
 	});
 	reloadSchedule;
@@ -415,6 +697,18 @@ sub parsed
 	$self
 }
 
+sub set
+{
+	my($self, $key, $value) = @_;
+	$self->{$key} = $value;
+}
+
+sub get
+{
+	my($self, $key) = @_;
+	$self->{$key}
+}
+
 sub iterate
 {
 	my($self) = @_;
@@ -426,6 +720,7 @@ sub iterate
 	}
 	$self->{'parsed'}[$i]
 }
+
 sub getDigestByHashRef
 {
 	my($self,$scheduleHash, @ignoreList) = @_;
@@ -468,18 +763,61 @@ sub explode
 	@$hashs = grep { $_ } @$hashs;
 }
 
+sub getVariableValue
+{
+	my($self,$name) = @_;
+	my $fname = $self->{'VARIABLES_DIR'} . $name;
+	return 'undefined' unless -f $fname;
+	my $firstValue = $self->{'VARIABLES'}{$name}[0];
+	my $fbody = '';
+
+	if(open my $fh, '<', $fname)
+	{
+		while(read $fh, my $buf, 100)
+		{
+			$fbody .= $buf;
+		}
+		close $fh;
+	}
+	else
+	{
+		$fbody = $firstValue;
+		if(open my $fh, '>', $fname)
+		{
+			print $fh $firstValue;
+			close $fh;
+		}
+	}
+	chomp $fbody;
+	$fbody
+}
+
+sub mergeVariables
+{
+	my($self, $rcli) = @_;
+	for my $name(keys %{$self->{'VARIABLES'}})
+	{
+		$$rcli =~ s/\{\s*($name)\s*\}/$self->getVariableValue($1)/eg;
+	}
+}
+
 sub parse
 {
-	my($self,$fbody) = @_;
+	my($self, $fbody, $option) = @_;
 	my @rows = split /\r?\n/, $fbody;
 	grep { s/^\s+// } @rows;
 	@rows = grep { /^[^#]/ } @rows;
 	my @result;
 
+	my $log = '';
+
 	for my $row(@rows)
 	{
 		my($minute, $hour, $day, $month, $weekday, $cli) = split /\s/, $row, 6;
+
 		$cli or next;
+		$self->mergeVariables(\$cli) if($option ne 'novariables' and  $self->{'VARIABLES_DIR'});
+
 		push @result, {
 			minute  => $minute,
 			hour    => $hour,
@@ -489,7 +827,6 @@ sub parse
 			cli     => $cli,
 		};
 	}
-
 	$self->explode(\@result);
 	$self->parsed(\@result);
 }
@@ -501,32 +838,31 @@ __END__
 先頭付近の以下をそれなりに設定します。
 
 my $RELOAD_SECOND   = 60; # loop cycle
-
 スケジュールファイルのリロード周期です。(60秒毎)
 
 my $SCHEDULE_MINUTE = 5;  # schedule cycle
-
 5で最長5分後の予定まで予約します。
 
 my $SCHEDULE_FILE_PATH = '/var/citool/etc/cron.txt';
-
 スケジュールファイルのパスです。crontab形式です。
-*/5 の形式は使えません。5,10,15 の形式は使えます。
 
+*/5 の形式は使えません。
+5-15の範囲指定も使えません。
+5,10,15 の形式は使えます。
 0,1,5,10 1,2,3,4,5 * * * echo '寝たら死ぬぞi!!'
 
 my $SCHEDULE_LOG_PATH  = '/var/citool/logs/schedule.log';
-
 スケジュール登録のログファイルです。空文字ならログ出力しません。
 
 my $RESULT_LOG_PATH    = '/var/citool/logs/result.log';
-
 スケジュール実行結果のログファイルです。空文字ならログ出力しません。
 
-my $LOG_ROTATE_DIR = '/var/cittol/logs';
-
+my $LOG_ROTATE_DIR = '/var/citool/logs';
 ログを毎日退避させるディレクトリを指定します。空文字なら何もしません。
 
+設置ディレクトリに/var/citoolをリンクさせると楽です。
 
+	ex)
+		$ sudo ln -s /home/you/smallcron /var/citool
 
 
