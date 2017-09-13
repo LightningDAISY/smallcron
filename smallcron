@@ -199,7 +199,6 @@ sub updateVariables
 	my $isMatched = 0;
 	for my $name(keys %$VARIABLES)
 	{
-		writeScheduleLog('SEARCH VAL ' . $name);
 		if($cli =~ /\{\s*$name\s*\}/)
 		{
 			writeScheduleLog('VAL ' . $name . ' IS MATCHED');
@@ -835,7 +834,8 @@ sub splitLines
 
 sub parse
 {
-	my($self, $fbody, $option) = @_;
+	my($self, $fbody, $options) = @_;
+	$options ||= [];
 	my @rows = split /\r?\n/, $fbody;
 	grep { s/^\s+// } @rows;
 	@rows = grep { /^[^#]/ } @rows;
@@ -847,7 +847,11 @@ sub parse
 		my($minute, $hour, $day, $month, $weekday, $cli) = split /\s+/, $row, 6;
 		$cli or next;
 		$self->isMatchedDatetime($row) or next;
-		$self->mergeVariables(\$cli) if($option ne 'novariables' and  $self->{'VARIABLES_DIR'});
+		$self->mergeVariables(\$cli) if(
+			$options->[0] and
+			$options->[0] ne 'novariables' and
+			$self->{'VARIABLES_DIR'}
+		);
 		push @result, {
 			minute  => $minute,
 			hour    => $hour,
