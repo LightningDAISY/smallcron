@@ -17,22 +17,56 @@ my $RESULT_LOG_PATH    = '/var/citool/logs/result.log';
 my $LOG_ROTATE_DIR     = '/var/citool/logs/old';
 my $VARIABLES_DIR      = '/var/citool/variables/';
 
+#
+# 変数を使うには、ここに設定を書き、更に変数ファイルが必要です。
+# （無いと初回だけundefinedになります）
+# $VARIABLES_DIR以下に変数名のファイルを置き、初回の値を記入します。
+# 以降実行毎に、ファイルの内容が設定値なら次の値、最後まで行けば先頭に戻ります。
+#
+# [To:{cwid}] {cwname}
 my $VARIABLES = {
-	cwid => [
-		qw{1111111 1111112 1111113}
-	],
-	cwname => [
-		qw{フェラー クリンスマン マテウス}
-	],
+	cwid => [],
+	cwname => [],
 };
 
 my $time;
 my %jobs;
 my $inputBody = '';
 
+sub timeEmulation
+{
+	# 1484291635 - 15 * 60 # 1/13 15:58:55
+	$time ||= time
+}
+
+#
+# n分後までのcron日時配列を生成
+#
+sub generateAfter5minCronTime
+{
+	my($afterMinutes) = @_;
+	$afterMinutes ||= $SCHEDULE_MINUTE;
+	my @datetimes;
+	my $now = time;
+	for my $i(0..$afterMinutes)
+	{
+		my($sec,$min,$hour,$day,$month,$year,$wday) = localtime($now + $i * 60);
+		push @datetimes, {
+			month  => $month+1,
+			day    => $day,
+			hour   => $hour,
+			minute => $min,
+			day    => $day,
+		};
+	}
+	\@datetimes
+}
+
 sub getParser
 {
-	my($option) = @_;
+	my($options) = @_;
+	my $datetimes = generateAfter5minCronTime($SCHEDULE_MINUTE);
+
 	$inputBody = '';
 	if($SCHEDULE_FILE_PATH)
 	{
@@ -46,17 +80,21 @@ sub getParser
 	{
 		while(read STDIN, my $buff, 100) { $inputBody .= $buff; }
 	}
-	my $parser = Parse::Cron->new();
-	$parser->set(VARIABLES_DIR => $VARIABLES_DIR);
-	$parser->set(VARIABLES => $VARIABLES);
-	$parser->parse($inputBody, $option)
+	my $parser = Parse::Cron->new(
+		DATETIMES     => $datetimes,
+		VARIABLES_DIR => $VARIABLES_DIR,
+		VARIABLES     => $VARIABLES,
+	);
+	$parser->parse($inputBody, $options)
 }
 
 sub getNowDatetime
 {
-	my($sec,$min,$hour,$day,$mon,$year,$wday) = localtime($time);
+	my($argTime) = @_;
+	$argTime ||= timeEmulation;
+	my($sec,$min,$hour,$day,$mon,$year,$wday) = localtime($argTime);
 	+{
-		second => $sec,
+		second  => $sec,
 		minute  => $min,
 		hour    => $hour,
 		day     => $day,
@@ -88,12 +126,12 @@ sub rotateLog
 	my($sec,$min,$hour,$day,$mon,$year) = localtime $mtime;
 	my $nowDatetime = getNowDatetime;
 
-	#return $nowDatetime->{'day'} == $day
+	return if $nowDatetime->{'day'} == $day;
 
 	{
 		my @parts = split m!(?:/|\\)!, $path;
 		my $fname = $parts[$#parts];
-		my $rotateFilePath = sprintf('%s/%s.%s%02d%02d.gz', $LOG_ROTATE_DIR, $fname, $year, $mon, $day);
+		my $rotateFilePath = sprintf('%s/%s.%s%02d%02d.gz', $LOG_ROTATE_DIR, $fname, $year+1900, $mon+1, $day);
 		gzip $path => $rotateFilePath or do {
 			say 'gzip failed: ' . $GzipError;
 			return
@@ -114,8 +152,8 @@ sub writeScheduleLog
 	my $fh = FileHandle->new($SCHEDULE_LOG_PATH, 'a') or die(
 		'cannot write ' . $SCHEDULE_LOG_PATH
 	);
-	my $nowDatetime = getNowDatetime;
-	my $datetimeString = $LOG_ROTATE_DIR . datetime2string($nowDatetime);
+	my $nowDatetime = getNowDatetime(time);
+	my $datetimeString = datetime2string($nowDatetime);
 	$fh->printf("[%s] %s\n", $datetimeString, $string);
 	$fh->close;
 }
@@ -132,150 +170,6 @@ sub writeResultLog
 	my $datetimeString = datetime2string($nowDatetime);
 	$fh->printf("[%s] %s\n", $datetimeString, $string);
 	$fh->close;
-}
-
-#
-# $weekdayNumber : 0:Sun 1:Mon 2:Tue 3:Wed 4:Thu 5:Fri 6:Sat
-#
-sub getDaysAfterNextWeekday
-{
-	my($weekdayNumber) = @_;
-	my $nowDatetime = getNowDatetime;
-	$nowDatetime->{'wday'} < $weekdayNumber ?
-		$weekdayNumber - $nowDatetime->{'wday'} :
-		$weekdayNumber - $nowDatetime->{'wday'} + 7
-	;
-}
-
-sub isValidDatetime
-{
-	my($year,$month,$day,$hour,$min,$sec,$wday) = @_;
-	for my $arg($year,$month,$day,$hour,$min,$sec)
-	{
-		return if $arg !~ /^\d+$/
-	}
-	return if(
-		$month < 1 or $month > 12 or
-		$day > 31 or $hour > 23 or $min > 59 or $sec > 59
-	);
-	return if($wday and $wday ne '*' and $wday > 6);
-	return 1
-}
-
-#
-# 最も近い未来の実行日時を求めます。
-#
-# 5,10,15 4 * * * shutdown -h 0
-#
-# のようなカンマ区切りは事前に以下の形式に展開してください。
-#
-# 5 4 * * * shutdown -h 0
-# 10 4 * * * shutdown -h 0
-# 15 4 * * * shutdown -h 0
-#
-sub getScheduleDatetime
-{
-	my($schedule) = @_;
-	my $hourExtend  = 0; # 1 or 0
-	my $dayExtend   = 0; # 1 or 0
-	my $monthExtend = 0; # 1 or 0
-	my $yearExtend  = 0; # 1 or 0
-
-	my $nowDatetime = getNowDatetime;
-
-	my $min   = $schedule->{'minute'};
-	my $hour  = $schedule->{'hour'}  eq '*' ? $nowDatetime->{'hour'}  : $schedule->{'hour'};
-	my $day   = $schedule->{'day'}   eq '*' ? $nowDatetime->{'day'}   : $schedule->{'day'};
-	my $wday  = $schedule->{'weekday'}  eq '7' ? 0 : $schedule->{'weekday'};
-	my $month = $schedule->{'month'} eq '*' ? $nowDatetime->{'month'}: $schedule->{'month'};
-	my $year  = $nowDatetime->{'year'};
-
-	return if not isValidDatetime($year,$month,$day,$hour,$min,0,$wday); 
-
-	# hour
-	if($nowDatetime->{'minute'} > $min)
-	{
-		if($schedule->{'hour'} eq '*')     { $hourExtend  = 1 }
-		elsif($schedule->{'day'} eq '*')   { $dayExtend   = 1 }
-		elsif($schedule->{'month'} eq '*') { $monthExtend = 1 }
-		else                               { $yearExtend  = 1 }
-	}
-	# day
-	if($nowDatetime->{'hour'} > $hour)
-	{
-		if($schedule->{'day'} eq '*')      { $dayExtend   = 1 }
-		elsif($schedule->{'month'} eq '*') { $monthExtend = 1 }
-		else                               { $yearExtend  = 1 }
-	}
-	# month
-	if($nowDatetime->{'day'} > $day)
-	{
-		if($schedule->{'month'} eq '*') { $monthExtend = 1 }
-		else                            { $yearExtend  = 1 }
-	}
-	# year
-	if($nowDatetime->{'month'} > $month)
-	{
-		$yearExtend  = 1
-	}
-
-	# Add year & month
-	my $paramMonth = $month - 1 + $monthExtend;
-	if($paramMonth >= 12)
-	{
-		$paramMonth = 0;
-		$yearExtend = 1;
-	}
-
-	my $scheduleTime  = timelocal(0,$min,$hour,$day,$paramMonth, $year + $yearExtend);
-
-
-	# Add day & hour
-	$scheduleTime += $hourExtend * 3600 + $dayExtend * 3600 * 24;
-
-	my($rsec,$rmin,$rhour,$rday,$rmon,$ryear,$rwday) = localtime($scheduleTime);
-	return if($wday ne '*' and $rwday ne $wday); 
-	+{
-		second  => $rsec,
-		minute  => $rmin,
-		hour    => $rhour,
-		day     => $rday,
-		month   => $rmon + 1,
-		year    => $ryear + 1900,
-		weekday => $rwday,
-	}
-}
-
-#
-# 5分以内に起こるスケジュールを抽出
-#
-sub getRecentSchedules
-{
-	my($minute) = @_;
-	$minute ||= $SCHEDULE_MINUTE;
-	my $parser = getParser('novariables');
-	my $nowDatetime = getNowDatetime();
-	my @result;
-
-	while(my $row = $parser->iterate)
-	{
-		my $dt = getScheduleDatetime($row) or next;
-
-		my $scheduleTime = timelocal(
-			$dt->{'second'},
-			$dt->{'minute'},
-			$dt->{'hour'},
-			$dt->{'day'},
-			$dt->{'month'} - 1,
-			$dt->{'year'},
-		);
-		if($scheduleTime > $time and $time + $minute * 60 > $scheduleTime)
-		{
-			$row->{'secondAfter'} = $scheduleTime - $time;
-			push @result, $row;
-		}
-	}
-	\@result
 }
 
 sub getNextVariableValue
@@ -305,12 +199,12 @@ sub updateVariables
 	my $isMatched = 0;
 	for my $name(keys %$VARIABLES)
 	{
-	writeScheduleLog('VAL IS ' . $name);
+		writeScheduleLog('SEARCH VAL ' . $name);
 		if($cli =~ /\{\s*$name\s*\}/)
 		{
-	writeScheduleLog('VAL IS MATCHED');
+			writeScheduleLog('VAL ' . $name . ' IS MATCHED');
 			my $nextValue = getNextVariableValue($name);
-	writeScheduleLog('VAL NEXT IS ' . $nextValue);
+			writeScheduleLog('NEXT VAL IS ' . $nextValue);
 			my $fname = $VARIABLES_DIR . $name;
 			open my $fh, '>', $fname or return;
 			print $fh $nextValue;
@@ -319,14 +213,39 @@ sub updateVariables
 	}
 }
 
+sub getSecondAfter
+{
+	# ここに来た時点で5分以内なので
+	# 1時間以上先のスケジュールは考えない(分しか見ない)
+	#
+	my($hash) = @_;
+	my $now = getNowDatetime;
+	my $minute = $hash->{'minute'} =~ /\D/ ? $now->{'minute'} : $hash->{'minute'};
+	if($now->{'minute'} > $minute)
+	{
+		$minute = 60 + $hash->{'minute'}
+	}
+	if($minute < 0)
+	{
+		say 'ERROR : minute = 60 + ' . $hash->{'minute'};
+	}
+	60 * ($minute - $now->{'minute'}) || 10 # 今なら10秒後
+}
+
 sub setSchedule
 {
 	my($scheduleHash) = @_;
-	my $parser = Parse::Cron->new();
-	$parser->set(VARIABLES_DIR => $VARIABLES_DIR);
-	$parser->set(VARIABLES => $VARIABLES);
+	my $parser = getParser([]);
 	my $digest = $parser->getDigestByHashRef($scheduleHash, 'secondAfter');
 	$jobs{$digest} = $scheduleHash;
+	$scheduleHash->{'secondAfter'} ||= getSecondAfter($scheduleHash);
+
+	say('SECOND AFTER : ' . $scheduleHash->{'secondAfter'});
+	if($scheduleHash->{'secondAfter'} < 0)
+	{
+		say Dumper($scheduleHash);
+	}
+
 	writeScheduleLog(
 		$scheduleHash->{'cli'} . ' at ' .
 		$scheduleHash->{'secondAfter'} . 'seconds after.'
@@ -347,15 +266,9 @@ sub setSchedule
 sub scheduleHasSet
 {
 	my($scheduleHash) = @_;
-	my $parser = Parse::Cron->new();
+	my $parser = getParser(['novariables']);
 	my $digest = $parser->getDigestByHashRef($scheduleHash, 'secondAfter');
     exists $jobs{$digest} ? 1 : undef
-}
-
-sub timeEmulation
-{
-	# 1484291635 - 15 * 60 # 1/13 15:58:55
-	time
 }
 
 #
@@ -363,11 +276,12 @@ sub timeEmulation
 #
 sub reloadSchedule
 {
+	use Data::Dumper;
 	$time = timeEmulation;
 	Mojo::IOLoop->timer($RELOAD_SECOND => sub {
 		writeScheduleLog('RELOAD');
-		my $schedules = getRecentSchedules;
-		for my $schedule(@$schedules)
+		my $parser = getParser(['novariables']);
+		while(my $schedule = $parser->iterate)
 		{
 			# 既に登録済なら無視
 			if(scheduleHasSet($schedule))
@@ -539,7 +453,7 @@ sub getAllSchedule
 {
 	my($stream,$number) = @_;
 	$number ||= 1;
-	my $parser = getParser;
+	my $parser = getParser(['novariables']);
 	my @schedules;
 	for(my $i=0; $i<$number; $i++)
 	{
@@ -673,7 +587,50 @@ sub loop
 	Mojo::IOLoop->start unless Mojo::IOLoop->is_running;
 }
 
+writeScheduleLog('SERVER STARTED');
 loop;
+writeScheduleLog('SERVER FINISHED');
+
+package JPDate;
+use strict;
+use warnings;
+use Data::Dumper;
+use feature qw{ say };
+
+sub new
+{
+	my($class, %args) = @_;
+	$args{'weekday'} ||= ['日', '月', '火', '水', '木', '金', '土'];
+	$args{'month_suffix'} ||= '月';
+	$args{'day_suffix'} ||= '日';
+	$args{'time'} ||= time;
+	bless \%args, $class
+}
+
+#
+# my $jpdate = JPDate->new;
+# my $weekday_6days_after = $jpdate->weekday(6 * 24 * 3600);
+# my $day_6days_after = $jpdate->day(6);
+#
+sub weekday
+{
+	my($self, $secs_after) = @_;
+	$secs_after ||= 0;
+	my($sec,$min,$hour,$day,$month,$year,$wday) = localtime(
+		$self->{'time'} + $secs_after
+	);
+	$self->{'weekday'}[$wday]
+}
+
+sub day
+{
+	my($self, $secs_after) = @_;
+	$secs_after ||= 0;
+	my($sec,$min,$hour,$day,$month,$year,$wday) = localtime(
+		$self->{'time'} + $secs_after
+	);
+	$day . $self->{'day_suffix'}
+}
 
 package Parse::Cron;
 use strict;
@@ -718,6 +675,7 @@ sub iterate
 		$self->{'counter'} = 0;
 		return;
 	}
+
 	$self->{'parsed'}[$i]
 }
 
@@ -792,6 +750,21 @@ sub getVariableValue
 	$fbody
 }
 
+sub getJPDate
+{
+	my($self, $method, $pm, $num, $unit) = @_;
+	my $jpdate = JPDate->new;
+	my $addition = $pm eq '+' ? $num : $num * -1;
+	my %units = (
+		'days'  => 24 * 3600,
+		'hours' => 3600,
+		'mins'  => 60,
+		'secs'  => 1,
+	);
+	$addition *= $units{$unit};
+	$jpdate->$method($addition)
+}
+
 sub mergeVariables
 {
 	my($self, $rcli) = @_;
@@ -799,6 +772,65 @@ sub mergeVariables
 	{
 		$$rcli =~ s/\{\s*($name)\s*\}/$self->getVariableValue($1)/eg;
 	}
+
+	$$rcli =~ s/\{\s*(weekday|day)\s*(\+|\-)\s*(\d+)\s*(days)\s*\}/$self->getJPDate($1,$2,$3,$4)/eg;
+}
+
+sub isMatchedDatetime
+{
+	my($self, $row) = @_;
+	return 1 if(not exists $self->{'DATETIMES'} or not $self->{'DATETIMES'});
+	my($minute, $hour, $day, $month, $weekday, $cli) = split /\s+/, $row, 6;
+
+	my $isMatched = 1;
+	for my $datetime(@{$self->{'DATETIMES'}})
+	{
+		if(
+			($month  eq '*' or int($month)  == int($datetime->{'month'})) and
+			($day    eq '*' or int($day)    == int($datetime->{'day'}))   and
+			($hour   eq '*' or int($hour)   == int($datetime->{'hour'}))  and
+			($minute eq '*' or int($minute) == int($datetime->{'minute'}))
+		) 
+		{
+			return 1;
+			last;
+		}
+	}
+	0
+}
+
+#
+# カンマ区切り日時を複数行に
+#
+sub splitLines
+{
+	my($self, $rows) = @_;
+	my @result;
+	my %row;
+	my $lastLineNumber = $#$rows;
+	for(my $i=0; $i<=$lastLineNumber; $i++)
+	{
+		next if not $rows->[$i];
+		($row{'minute'}, $row{'hour'}, $row{'day'}, $row{'month'}, $row{'weekday'}, $row{'cli'}) = split /\s+/, $rows->[$i], 6;
+		my $str = $row{'minute'} . $row{'hour'} . $row{'day'} . $row{'month'} . $row{'weekday'};
+		next if $str !~ /,/;
+		for my $name(qw{minute hour day month weekday})
+		{
+			next if $row{$name} !~ /,/;
+			my @nums = split /,/, $row{$name};
+			$rows->[$i] = '';
+			for my $num(@nums)
+			{
+				my %tmp = %row;
+				$tmp{$name} = $num;
+				push @$rows, sprintf(
+					'%s %s %s %s %s %s', $tmp{'minute'}, $tmp{'hour'}, $tmp{'day'}, $tmp{'month'}, $tmp{'weekday'}, $tmp{'cli'}
+				);
+				$lastLineNumber++;
+			}
+		}
+	}
+	@$rows = grep { !/^\s*$/ } @$rows;
 }
 
 sub parse
@@ -807,17 +839,15 @@ sub parse
 	my @rows = split /\r?\n/, $fbody;
 	grep { s/^\s+// } @rows;
 	@rows = grep { /^[^#]/ } @rows;
+	$self->splitLines(\@rows);
+
 	my @result;
-
-	my $log = '';
-
 	for my $row(@rows)
 	{
-		my($minute, $hour, $day, $month, $weekday, $cli) = split /\s/, $row, 6;
-
+		my($minute, $hour, $day, $month, $weekday, $cli) = split /\s+/, $row, 6;
 		$cli or next;
+		$self->isMatchedDatetime($row) or next;
 		$self->mergeVariables(\$cli) if($option ne 'novariables' and  $self->{'VARIABLES_DIR'});
-
 		push @result, {
 			minute  => $minute,
 			hour    => $hour,
@@ -828,7 +858,7 @@ sub parse
 		};
 	}
 	$self->explode(\@result);
-	$self->parsed(\@result);
+	$self->parsed(\@result)
 }
 
 1
@@ -838,31 +868,33 @@ __END__
 先頭付近の以下をそれなりに設定します。
 
 my $RELOAD_SECOND   = 60; # loop cycle
+
 スケジュールファイルのリロード周期です。(60秒毎)
 
 my $SCHEDULE_MINUTE = 5;  # schedule cycle
+
 5で最長5分後の予定まで予約します。
 
 my $SCHEDULE_FILE_PATH = '/var/citool/etc/cron.txt';
-スケジュールファイルのパスです。crontab形式です。
 
-*/5 の形式は使えません。
-5-15の範囲指定も使えません。
-5,10,15 の形式は使えます。
+スケジュールファイルのパスです。crontab形式です。
+*/5 の形式は使えません。5,10,15 の形式は使えます。
+全て*にすると毎日毎分毎時実行します。
+
 0,1,5,10 1,2,3,4,5 * * * echo '寝たら死ぬぞi!!'
 
 my $SCHEDULE_LOG_PATH  = '/var/citool/logs/schedule.log';
+
 スケジュール登録のログファイルです。空文字ならログ出力しません。
 
 my $RESULT_LOG_PATH    = '/var/citool/logs/result.log';
+
 スケジュール実行結果のログファイルです。空文字ならログ出力しません。
 
-my $LOG_ROTATE_DIR = '/var/citool/logs';
+my $LOG_ROTATE_DIR = '/var/cittol/logs';
+
 ログを毎日退避させるディレクトリを指定します。空文字なら何もしません。
 
-設置ディレクトリに/var/citoolをリンクさせると楽です。
 
-	ex)
-		$ sudo ln -s /home/you/smallcron /var/citool
 
 
