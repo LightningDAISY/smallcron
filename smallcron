@@ -52,11 +52,11 @@ sub generateAfter5minCronTime
 	{
 		my($sec,$min,$hour,$day,$month,$year,$wday) = localtime($now + $i * 60);
 		push @datetimes, {
-			month  => $month+1,
-			day    => $day,
-			hour   => $hour,
-			minute => $min,
-			day    => $day,
+			month   => $month+1,
+			day     => $day,
+			hour    => $hour,
+			minute  => $min,
+			weekday => $wday,
 		};
 	}
 	\@datetimes
@@ -788,7 +788,8 @@ sub isMatchedDatetime
 			($month  eq '*' or int($month)  == int($datetime->{'month'})) and
 			($day    eq '*' or int($day)    == int($datetime->{'day'}))   and
 			($hour   eq '*' or int($hour)   == int($datetime->{'hour'}))  and
-			($minute eq '*' or int($minute) == int($datetime->{'minute'}))
+			($minute eq '*' or int($minute) == int($datetime->{'minute'})) and
+			($weekday eq '*' or int($weekday) == int($datetime->{'weekday'}))
 		) 
 		{
 			return 1;
